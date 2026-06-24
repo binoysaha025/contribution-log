@@ -204,3 +204,87 @@ curl -X POST http://localhost:8080/completion \
 ```
 
 **Status:** Phase II Complete
+
+
+## Implementation Notes
+
+### Week 3 Progress
+
+Implemented token healing in the llama.cpp server via logit masking 
+at sampling time — a single-pass approach rather than the retry-loop 
+used by the existing stalled PR (#19238).
+
+Work completed:
+- Added `token_healing` bool to `gpt_params` (default false, no 
+  regression when disabled)
+- Added `healing_prefix` byte-string field to the sampling context
+- In `server.cpp`: on a completion request with `token_healing=true`, 
+  tokenize the prompt, extract the final token's byte string, strip 
+  it from the prompt before inference, and store the prefix in the 
+  sampling context
+- In `llama_sampling_sample` (`common/sampling.cpp`): added a prefix 
+  filtering pass that zeroes logits for all vocabulary tokens whose 
+  decoded bytes do not start with `healing_prefix`, then samples 
+  normally from the constrained distribution; prefix is cleared after 
+  the first token so generation continues unconstrained
+
+### Challenges
+
+- Mapping vocabulary token IDs back to their byte strings for the 
+  prefix comparison required using the model's token-to-piece 
+  conversion rather than assuming UTF-8 directly — needed to handle 
+  byte-fallback tokens correctly
+- Edge case: multi-byte UTF-8 prefixes where the rewound token splits 
+  a codepoint; handled by comparing at the raw byte level, not 
+  character level
+- Ensuring the constraint applies only to the first generated token, 
+  not the whole sequence
+
+### Approach Decisions
+
+- Chose logit masking over retry generation because retrying requires 
+  multiple inference passes — unacceptable for a production server. 
+  Single-pass masking keeps it O(1) in forward passes.
+- Located the logic in the sampling layer per maintainer guidance 
+  (ggerganov pointed to `llama_sampling_sample` in the issue thread)
+
+---
+
+## Testing Strategy
+
+### Manual Testing
+
+Validated against the example prompts from issue #5765:
+
+```bash
+# Mid-word prompt — healing on
+curl -X POST http://localhost:8080/completion \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Five, Four, Thr", "token_healing": true, 
+       "n_predict": 5}' | jq '.content'
+# Produces prefix-matching continuation ("ee, Two, One")
+
+# Same prompt — healing off (baseline preserved)
+curl -X POST http://localhost:8080/completion \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Five, Four, Thr", "token_healing": false,
+       "n_predict": 5}' | jq '.content'
+# Produces original unconstrained behavior
+```
+
+### Validation Steps
+
+- [x] Mid-word prompt produces prefix-matching first token
+- [x] Full-word behavior unchanged when `token_healing=false`
+- [x] Single-character prefix constrains correctly
+- [x] Unicode multi-byte prefix handled at byte level
+- [ ] Confirmed no regression on existing server test suite
+- [ ] Verified single inference pass via server timing logs
+
+### Next Steps (Phase IV)
+
+- Open PR against ggml-org/llama.cpp
+- Address maintainer feedback
+- Add automated test case to server test suite if requested
+
+**Status:** Phase III Complete
